@@ -21,6 +21,18 @@ from config import YT_API_KEY, YTPROXY_URL as YTPROXY
 
 logger = LOGGER(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  YTPROXY  →  should be set to  https://api.solotree.in  in your config.py
+#  YT_API_KEY  →  your own API key (the one set in api.solotree.in)
+#
+#  Flow for every song request:
+#    1. Bot calls  GET api.solotree.in/song/{vid_id}  with x-api-key header
+#    2. api.solotree.in checks its MongoDB first  (own cache — free, instant)
+#    3. On miss, api.solotree.in calls friend's xbitcode API (uses their 1500/day)
+#    4. Downloads + uploads to your Telegram channel + saves to MongoDB
+#    5. Returns audio_url / video_url to the bot
+# ─────────────────────────────────────────────────────────────────────────────
+
 def cookie_txt_file():
     try:
         folder_path = f"{os.getcwd()}/cookies"
@@ -45,11 +57,10 @@ class YouTubeAPI:
         self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
         self.dl_stats = {
             "total_requests": 0,
-            "okflix_downloads": 0,
-            "cookie_downloads": 0,
+            "solotree_cache_hits": 0,   # served from own MongoDB cache
+            "solotree_xbit_hits": 0,    # served via xbitcode (friend's API)
             "existing_files": 0
         }
-
 
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
@@ -93,7 +104,6 @@ class YouTubeAPI:
         elif "&si=" in link:
             link = link.split("&si=")[0]
 
-
         results = VideosSearch(link, limit=1)
         for result in (await results.next())["result"]:
             title = result["title"]
@@ -115,7 +125,7 @@ class YouTubeAPI:
             link = link.split("?si=")[0]
         elif "&si=" in link:
             link = link.split("&si=")[0]
-            
+
         results = VideosSearch(link, limit=1)
         for result in (await results.next())["result"]:
             title = result["title"]
@@ -289,7 +299,6 @@ class YouTubeAPI:
             search = VideosSearch(link, limit=10)
             search_results = (await search.next()).get("result", [])
 
-            # Filter videos longer than 1 hour
             for result in search_results:
                 duration_str = result.get("duration", "0:00")
                 try:
@@ -346,30 +355,27 @@ class YouTubeAPI:
         async def download_with_requests(url, filepath, headers=None):
             try:
                 session = create_session()
-                
-                # Use headers for authentication (including x-api-key)
-                # allow_redirects=True handles redirects, stream=True for large files
                 response = session.get(
-                    url, 
-                    headers=headers, 
-                    stream=True, 
+                    url,
+                    headers=headers,
+                    stream=True,
                     timeout=60,
                     allow_redirects=True
                 )
                 response.raise_for_status()
-                
+
                 total_size = int(response.headers.get('content-length', 0))
                 downloaded = 0
-                chunk_size = 1024 * 1024  # 1MB chunks for large files
-                
+                chunk_size = 1024 * 1024  # 1MB chunks
+
                 with open(filepath, 'wb') as file:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if chunk:
                             file.write(chunk)
                             downloaded += len(chunk)
-                
+
                 return filepath
-                
+
             except Exception as e:
                 logger.error(f"Requests download failed: {str(e)}")
                 if os.path.exists(filepath):
@@ -378,205 +384,241 @@ class YouTubeAPI:
             finally:
                 session.close()
 
+        # ─────────────────────────────────────────────────────────────────────
+        #  All 4 download helpers below now call api.solotree.in/song/{vid_id}
+        #  which handles caching internally. The bot just downloads the file.
+        # ─────────────────────────────────────────────────────────────────────
+
         async def audio_dl(vid_id):
             try:
                 if not YT_API_KEY:
-                    logger.error("API KEY not set in config, Set API Key you got from @tgmusic_apibot")
+                    logger.error("YT_API_KEY not set in config")
                     return None
                 if not YTPROXY:
-                    logger.error("API Endpoint not set in config\nPlease set a valid endpoint for YTPROXY_URL in config.")
+                    logger.error("YTPROXY_URL not set in config — set it to https://api.solotree.in")
                     return None
-                
+
                 headers = {
                     "x-api-key": f"{YT_API_KEY}",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
-                
+
                 filepath = os.path.join("downloads", f"{vid_id}.mp3")
-                
+
+                # Reuse already-downloaded file if present
                 if os.path.exists(filepath):
+                    self.dl_stats["existing_files"] += 1
                     return filepath
-                
+
+                self.dl_stats["total_requests"] += 1
+
+                # Call YOUR api.solotree.in  (not xbitcode directly)
                 session = create_session()
-                getAudio = session.get(f"{YTPROXY}/info/{vid_id}", headers=headers, timeout=60)
-                
+                resp = session.get(
+                    f"{YTPROXY}/song/{vid_id}",
+                    headers=headers,
+                    timeout=60
+                )
+
                 try:
-                    songData = getAudio.json()
+                    songData = resp.json()
                 except Exception as e:
-                    logger.error(f"Invalid response from API: {str(e)}")
+                    logger.error(f"Invalid response from api.solotree.in: {str(e)}")
                     return None
                 finally:
                     session.close()
-                
+
                 status = songData.get('status')
                 if status == 'success':
-                    audio_url = songData['audio_url']                    
+                    audio_url = songData['audio_url']
+
+                    # Track where it was served from
+                    source = songData.get('source', 'unknown')
+                    if source == 'own_cache':
+                        self.dl_stats["solotree_cache_hits"] += 1
+                    else:
+                        self.dl_stats["solotree_xbit_hits"] += 1
+
                     result = await download_with_requests(audio_url, filepath, headers)
                     if result:
                         return result
-                    
                     return None
-                    
+
                 elif status == 'error':
-                    logger.error(f"API Error: {songData.get('message', 'Unknown error from API.')}")
+                    logger.error(f"API Error from api.solotree.in: {songData.get('message', 'Unknown error')}")
                     return None
                 else:
-                    logger.error("Could not fetch Backend \nPlease contact API provider.")
+                    logger.error("Could not fetch from api.solotree.in")
                     return None
-                    
+
             except requests.exceptions.RequestException as e:
-                logger.error(f"Network error while fetching audio info: {str(e)}")
+                logger.error(f"Network error fetching from api.solotree.in: {str(e)}")
             except json.JSONDecodeError as e:
-                logger.error(f"Invalid response from proxy: {str(e)}")
+                logger.error(f"Invalid JSON from api.solotree.in: {str(e)}")
             except Exception as e:
-                logger.error(f"Error in audio download: {str(e)}")
-            
+                logger.error(f"Error in audio_dl: {str(e)}")
+
             return None
-        
-        
+
         async def video_dl(vid_id):
             try:
                 if not YT_API_KEY:
-                    logger.error("API KEY not set in config, Set API Key you got from @tgmusic_apibot")
+                    logger.error("YT_API_KEY not set in config")
                     return None
                 if not YTPROXY:
-                    logger.error("API Endpoint not set in config\nPlease set a valid endpoint for YTPROXY_URL in config.")
+                    logger.error("YTPROXY_URL not set in config — set it to https://api.solotree.in")
                     return None
-                
+
                 headers = {
                     "x-api-key": f"{YT_API_KEY}",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
-                
+
                 filepath = os.path.join("downloads", f"{vid_id}.mp4")
-                
+
                 if os.path.exists(filepath):
                     return filepath
-                
+
+                # Call YOUR api.solotree.in
                 session = create_session()
-                getVideo = session.get(f"{YTPROXY}/info/{vid_id}", headers=headers, timeout=60)
-                
+                resp = session.get(
+                    f"{YTPROXY}/song/{vid_id}",
+                    headers=headers,
+                    timeout=60
+                )
+
                 try:
-                    videoData = getVideo.json()
+                    videoData = resp.json()
                 except Exception as e:
-                    logger.error(f"Invalid response from API: {str(e)}")
+                    logger.error(f"Invalid response from api.solotree.in: {str(e)}")
                     return None
                 finally:
                     session.close()
-                
+
                 status = videoData.get('status')
                 if status == 'success':
-                    video_url = videoData['video_url']
-                    #video_url = base64.b64decode(videolink).decode() removed in 3.5.0
-                    
+                    video_url = videoData.get('video_url')
+                    if not video_url:
+                        logger.error("No video_url in response from api.solotree.in")
+                        return None
+
                     result = await download_with_requests(video_url, filepath, headers)
                     if result:
                         return result
-                    
                     return None
-                    
+
                 elif status == 'error':
-                    logger.error(f"API Error: {videoData.get('message', 'Unknown error from API.')}")
+                    logger.error(f"API Error: {videoData.get('message', 'Unknown error')}")
                     return None
                 else:
-                    logger.error("Could not fetch Backend \nPlease contact API provider.")
+                    logger.error("Could not fetch video from api.solotree.in")
                     return None
-                    
+
             except requests.exceptions.RequestException as e:
-                logger.error(f"Network error while fetching video info: {str(e)}")
+                logger.error(f"Network error: {str(e)}")
             except json.JSONDecodeError as e:
-                logger.error(f"Invalid response from proxy: {str(e)}")
+                logger.error(f"Invalid JSON from api.solotree.in: {str(e)}")
             except Exception as e:
-                logger.error(f"Error in video download: {str(e)}")
-            
+                logger.error(f"Error in video_dl: {str(e)}")
+
             return None
-        
+
         async def song_video_dl():
             try:
                 if not YT_API_KEY:
-                    logger.error("API KEY not set in config")
+                    logger.error("YT_API_KEY not set in config")
                     return None
                 if not YTPROXY:
-                    logger.error("API Endpoint not set in config")
+                    logger.error("YTPROXY_URL not set in config")
                     return None
-                
+
                 headers = {
                     "x-api-key": f"{YT_API_KEY}",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
-                
+
                 filepath = f"downloads/{title}.mp4"
-                
+
                 if os.path.exists(filepath):
                     return filepath
-                
+
                 session = create_session()
-                getVideo = session.get(f"{YTPROXY}/info/{vid_id}", headers=headers, timeout=60)
-                
+                resp = session.get(
+                    f"{YTPROXY}/song/{vid_id}",
+                    headers=headers,
+                    timeout=60
+                )
+
                 try:
-                    videoData = getVideo.json()
+                    videoData = resp.json()
                 except Exception as e:
-                    logger.error(f"Invalid response from API: {str(e)}")
+                    logger.error(f"Invalid response from api.solotree.in: {str(e)}")
                     return None
                 finally:
                     session.close()
-                
+
                 status = videoData.get('status')
                 if status == 'success':
-                    video_url = videoData['video_url']
-                    
+                    video_url = videoData.get('video_url')
+                    if not video_url:
+                        return None
                     result = await download_with_requests(video_url, filepath, headers)
                     return result
-                    
+
                 logger.error(f"API Error: {videoData.get('message', 'Unknown error')}")
                 return None
-                
+
             except Exception as e:
-                logger.error(f"Error in song video download: {str(e)}")
+                logger.error(f"Error in song_video_dl: {str(e)}")
                 return None
 
         async def song_audio_dl():
             try:
                 if not YT_API_KEY:
-                    logger.error("API KEY not set in config")
+                    logger.error("YT_API_KEY not set in config")
                     return None
                 if not YTPROXY:
-                    logger.error("API Endpoint not set in config")
+                    logger.error("YTPROXY_URL not set in config")
                     return None
-                
+
                 headers = {
                     "x-api-key": f"{YT_API_KEY}",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
-                
+
                 filepath = f"downloads/{title}.mp3"
-                
+
                 if os.path.exists(filepath):
                     return filepath
-                
+
                 session = create_session()
-                getAudio = session.get(f"{YTPROXY}/info/{vid_id}", headers=headers, timeout=60)
-                
+                resp = session.get(
+                    f"{YTPROXY}/song/{vid_id}",
+                    headers=headers,
+                    timeout=60
+                )
+
                 try:
-                    audioData = getAudio.json()
+                    audioData = resp.json()
                 except Exception as e:
-                    logger.error(f"Invalid response from API: {str(e)}")
+                    logger.error(f"Invalid response from api.solotree.in: {str(e)}")
                     return None
                 finally:
                     session.close()
-                
+
                 status = audioData.get('status')
                 if status == 'success':
-                    audio_url = audioData['audio_url']
-                    
+                    audio_url = audioData.get('audio_url')
+                    if not audio_url:
+                        return None
                     result = await download_with_requests(audio_url, filepath, headers)
                     return result
-                    
+
                 logger.error(f"API Error: {audioData.get('message', 'Unknown error')}")
                 return None
-                
+
             except Exception as e:
-                logger.error(f"Error in song audio download: {str(e)}")
+                logger.error(f"Error in song_audio_dl: {str(e)}")
                 return None
 
         if songvideo:
@@ -591,5 +633,5 @@ class YouTubeAPI:
         else:
             direct = True
             downloaded_file = await audio_dl(vid_id)
-        
+
         return downloaded_file, direct
